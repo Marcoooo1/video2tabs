@@ -1,0 +1,324 @@
+# Import necessary libraries
+import cv2
+import os
+import numpy as np
+from ultralytics import YOLO
+import mediapipe as mp
+from collections import Counter
+from pathlib import Path
+
+# Turns off Ultralytics logger
+from ultralytics.utils import LOGGER
+LOGGER.level = 'ERROR'
+
+# Configuration parameters
+CONF_THRESH_FRETS     = 0.25                # Confidence threshold for fret detection
+CONF_THRESH_STRINGS   = 0.25                # Confidence threshold for string detection
+MIN_CENTER_DIST       = 8                   # Minimum distance between object centers to avoid duplicates
+MIN_SPACING_STRINGS   = 20                  # Minimum required spacing between detected strings
+VELOCITY_THRESH       = 8                   # Threshold to detect downstroke motion
+MAX_KEYPOINT_DIST     = 5                   # Maximum distance from finger to string to consider contact
+
+# Configuration ASCII-File
+ARTIST_NAME           = "Marco Bayreder"    # Artist Name
+TEMPO                 = 120                 # Tempo (bpm)
+
+
+# Input video and model paths
+video_path         = ""                                       # Path for input video
+model_frets_path   = "/Models/OBB/Yolo11s-frets-V2.pt"        # Path for fret detection model
+model_strings_path = "/Models/OBB/Yolov8s-strings-V1.pt"      # Path for string detection model
+
+# Output paths for result video and tablature file
+base_dir     = os.path.dirname(video_path)
+base_name    = os.path.splitext(os.path.basename(video_path))[0]
+output_video = os.path.join(base_dir, f"{base_name}_tabs.mp4")
+output_txt   = os.path.join(base_dir, f"{base_name}_tabs.txt")
+
+# Load YOLO models for fret and string detection
+model_frets   = YOLO(model_frets_path)
+model_strings = YOLO(model_strings_path)
+
+# Initialize MediaPipe hand detection and drawing utilities
+mp_hands = mp.solutions.hands
+mp_draw  = mp.solutions.drawing_utils
+hands    = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=2,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+# Helper function to compute perpendicular distance from a point to a vector line
+def point_line_distance(P, v, pt):
+    w = np.array(pt) - P
+    proj = w.dot(v) * v
+    perp = w - proj
+    return np.linalg.norm(perp)
+
+# Set up video reading and output video writer
+cap    = cv2.VideoCapture(video_path)
+fps    = cap.get(cv2.CAP_PROP_FPS)
+W      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+H      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+out    = cv2.VideoWriter(output_video, fourcc, fps, (W, H))
+
+# Initialize data structures for downstroke tracking
+strokes_data      = []
+in_stroke         = False
+stroke_frames     = []
+prev_thumb_y_left = None
+frame_idx         = 0
+
+# String names and order for tablature formatting
+string_labels = ["E", "A", "D", "G", "B", "e"]
+prefixes = ["e", "B", "G", "D", "A", "E"]
+
+# Main processing loop for each video frame
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+    orig = frame.copy()
+
+    # Fret Detection
+    res_f = model_frets(orig, verbose=False)[0]
+    fret_centers = []
+    if res_f.obb is not None and len(res_f.obb):
+        data = res_f.obb.data.cpu().numpy()
+        data = data[data[:,5] >= CONF_THRESH_FRETS]
+        if data.size:
+            centers   = data[:, :2]
+            widths    = data[:, 2]
+            heights   = data[:, 3]
+            angles    = data[:, 4]
+            confs     = data[:, 5]
+            orientations = np.where(widths >= heights, angles, angles + np.pi/2)
+            angle_med    = np.median(orientations)
+            order = np.argsort(confs)[::-1]
+            keep  = []
+            for i in order:
+                if all(np.linalg.norm(centers[i] - centers[j]) >= MIN_CENTER_DIST for j in keep):
+                    keep.append(i)
+            centers = centers[keep]
+            sorted_fc    = sorted(centers, key=lambda p: p[0], reverse=True)
+            fret_centers = [(tuple(p), idx) for idx,p in enumerate(sorted_fc)]
+            for (cx, cy), num in fret_centers:
+                cv2.putText(frame, str(num), (int(cx), int(cy)-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+
+    # String Detection
+    res_s = model_strings(orig, verbose=False)[0]
+    string_centers = []
+    string_angle   = None
+    if res_s.obb is not None and len(res_s.obb):
+        data = res_s.obb.data.cpu().numpy()
+        data = data[data[:,5] >= CONF_THRESH_STRINGS]
+        if data.size:
+            centers = data[:, :2]
+            widths  = data[:, 2]
+            heights = data[:, 3]
+            angles  = data[:, 4]
+            confs   = data[:, 5]
+            orientations = np.where(widths >= heights, angles, angles + np.pi/2)
+            angle_med    = np.median(orientations)
+            t_vec = np.array([np.cos(angle_med), np.sin(angle_med)])
+            n_vec = np.array([-np.sin(angle_med), np.cos(angle_med)])
+            order = np.argsort(confs)[::-1]
+            keep  = []
+            for i in order:
+                if all(np.linalg.norm(centers[i] - centers[j]) >= MIN_CENTER_DIST for j in keep):
+                    keep.append(i)
+            centers = centers[keep]
+            proj_n = centers.dot(n_vec)
+            if len(proj_n) >= 2:
+                p_min, p_max = proj_n.min(), proj_n.max()
+                span = p_max - p_min
+                req  = MIN_SPACING_STRINGS * 5
+                if span < req:
+                    mid = (p_max + p_min) / 2
+                    p_min, p_max = mid-req/2, mid+req/2
+                step = (p_max - p_min) / 5
+                t_med = np.median(centers.dot(t_vec))
+                string_centers = [n_vec*(p_min + i*step) + t_vec*t_med for i in range(6)]
+            else:
+                string_centers = [centers[0]] * 6
+            string_centers = sorted(string_centers, key=lambda c: c[1])
+            string_angle   = angle_med
+            for idx,(cx, cy) in enumerate(string_centers):
+                dx, dy = np.cos(string_angle), np.sin(string_angle)
+                length = np.hypot(W, H) + 50
+                x1, y1 = int(cx - dx*length), int(cy - dy*length)
+                x2, y2 = int(cx + dx*length), int(cy + dy*length)
+                cv2.line(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+                cv2.putText(frame, string_labels[idx], (int(cx-10), int(cy-10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+
+    # Hand landmark detection
+    rgb            = cv2.cvtColor(orig, cv2.COLOR_BGR2RGB)
+    res_hands      = hands.process(rgb)
+    thumb_y_left   = None
+    fret_landmarks = {}
+
+    if res_hands.multi_hand_landmarks:
+        for lms, hand_h in zip(res_hands.multi_hand_landmarks, res_hands.multi_handedness):
+            label = hand_h.classification[0].label
+            for lm_id in [8,12,16,20,4]:
+                lm   = lms.landmark[lm_id]
+                x_px = int(lm.x * W)
+                y_px = int(lm.y * H)
+                if lm_id in [8,12,16,20] and label == "Right":
+                    fret_landmarks[lm_id] = (x_px, y_px)
+                if lm_id == 4 and label == "Left":
+                    thumb_y_left = y_px
+            mp_draw.draw_landmarks(frame, lms, mp_hands.HAND_CONNECTIONS)
+
+    # Detect downstroke motion using left thumb
+    if prev_thumb_y_left is not None and thumb_y_left is not None:
+        dy = thumb_y_left - prev_thumb_y_left
+        if dy > VELOCITY_THRESH:
+            if not in_stroke:
+                in_stroke = True
+                stroke_frames = []
+            in_down = True
+        else:
+            in_down = False
+            if in_stroke:
+                if stroke_frames:
+                    start_f = stroke_frames[0][0]
+                    end_f   = stroke_frames[-1][0]
+                    strokes_data.append({"frames": stroke_frames, "start": start_f, "end": end_f})
+                in_stroke = False
+    else:
+        in_down = False
+
+    # Update previous thumb position
+    prev_thumb_y_left = thumb_y_left if thumb_y_left is not None else prev_thumb_y_left
+
+    # If downstroke is active, map fingers to strings and frets
+    if in_down and fret_landmarks and string_centers and fret_centers:
+        frame_map = {}
+        t_vec = np.array([np.cos(string_angle), np.sin(string_angle)])
+        for s_idx, s_center in enumerate(string_centers):
+            distances = []
+            for kp_id, pt in fret_landmarks.items():
+                dist = point_line_distance(s_center, t_vec, pt)
+                if dist <= MAX_KEYPOINT_DIST:
+                    distances.append((kp_id, dist))
+            if not distances:
+                continue
+            selected_kp_id = max(distances, key=lambda x: x[0])[0]
+            selected_kp = fret_landmarks[selected_kp_id]
+            fret_left = min(
+                (fc for fc in fret_centers if fc[0][0] < selected_kp[0]),
+                key=lambda fc: abs(selected_kp[0] - fc[0][0]),
+                default=None
+            )
+            if fret_left is not None:
+                fret_num = fret_left[1]
+                string_label = string_labels[s_idx]
+                frame_map[selected_kp_id] = (string_label, fret_num)
+                cv2.circle(frame, selected_kp, 5, (0,0,255), -1)
+                cv2.putText(frame, f"{string_label}{fret_num}", (selected_kp[0]+5, selected_kp[1]-5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+        stroke_frames.append((frame_idx, frame_map))
+        cv2.putText(frame, "Downstroke", (50,50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,0,0), 2)
+    
+    # Write frame to output video
+    out.write(frame)
+    frame_idx += 1
+
+if in_stroke and stroke_frames:
+    start_f = stroke_frames[0][0]
+    end_f   = stroke_frames[-1][0]
+    strokes_data.append({"frames": stroke_frames, "start": start_f, "end": end_f})
+
+# Release video resources and close hand detector
+cap.release()
+out.release()
+hands.close()
+
+# Output stroke summaries to terminal
+for i, sd in enumerate(strokes_data, 1):
+    summary = {}
+    for fidx, fmap in sd["frames"]:
+        print(f"    Frame {fidx}:")
+        for fid, sf in fmap.items():
+            print(f"      Keypoint {fid} → Saite {sf[0]}, Bund {sf[1]}")
+            summary.setdefault(fid, []).append(sf)
+    print(f"Downstroke {i}:")
+    for fid in sorted(summary):
+        s_lbl, f_num = Counter(summary[fid]).most_common(1)[0][0]
+        print(f"  Keypoint {fid}: Saite {s_lbl}, Bund {f_num}")
+
+# Helper function: format tab lines with fixed length
+def format_tab_text_aligned(tab_blocks, line_length=60):
+    blocks = []
+    for block in tab_blocks:
+        max_len = max(len(v) for v in block.values())
+        padded = {k: v.ljust(max_len, '-') for k, v in block.items()}
+        width = max_len if max_len % line_length == 0 else ((max_len // line_length) + 1) * line_length
+        padded = {k: v.ljust(width, '-') for k, v in padded.items()}
+        for i in range(0, width, line_length):
+            lines = [f"{p.upper()} |{padded[p][i:i+line_length]}|" for p in prefixes]
+            blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+# Helper function: write tablature text to file
+def write_custom_tab_file(output_path, input_video_path, tab_blocks, artist_name, tempo):
+    title = Path(input_video_path).stem
+    header = f"""Title: {title}\nArtist:  {artist_name}\nTempo = {tempo}\nDistortion Guitar\n\n"""
+    tab_body = format_tab_text_aligned(tab_blocks)
+    full_text = header + tab_body + "\n"
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(full_text)
+
+# Generate tablature structure from strokes
+tab_blocks = []
+prev_end = None
+current_block = {p: '' for p in prefixes[::-1]}
+for sd in strokes_data:
+    # Fill gaps (rests) with dashes if there was a pause between strokes
+    if prev_end is not None:
+        silence = sd["start"] - prev_end - 1
+        if silence > 0:
+            for p in current_block:
+                current_block[p] += '-' * silence
+
+    # Aggregate notes by string and select most frequent fret per string
+    mapping = {}
+    for _, fmap in sd["frames"]:
+        for fid, (s_lbl, f_num) in fmap.items():
+            mapping.setdefault(s_lbl, []).append(f_num)
+
+    col = {p: '-' for p in prefixes[::-1]}
+    for p in mapping:
+        most = Counter(mapping[p]).most_common(1)[0][0]
+        col[p] = str(most)
+
+    # Normalize column width for alignment
+    width = max(len(x) for x in col.values())
+    for p in col:
+        col[p] = col[p].rjust(width, '-')
+    for p in current_block:
+        current_block[p] += col[p]
+
+    prev_end = sd["end"]
+
+    # When a line reaches 60 characters, save it as a block and reset
+    if all(len(current_block[p]) >= 60 for p in current_block):
+        tab_blocks.append(current_block)
+        current_block = {p: '' for p in prefixes[::-1]}
+
+# Append remaining block (if any)
+if any(len(current_block[p]) > 0 for p in current_block):
+    max_len = max(len(v) for v in current_block.values())
+    for p in current_block:
+        current_block[p] = current_block[p].ljust(max_len, '-')
+    tab_blocks.append(current_block)
+
+# Write tablature to file
+write_custom_tab_file(output_txt, video_path, tab_blocks, artist_name=ARTIST_NAME, tempo=TEMPO)
+print(f"Fertig: Video gespeichert in {output_video}")
+print(f"Fertig: Tab-Textdatei gespeichert in {output_txt}")
