@@ -15,7 +15,7 @@ LOGGER.level = 'ERROR'
 CONF_THRESH_FRETS     = 0.25                # Confidence threshold for fret detection
 CONF_THRESH_STRINGS   = 0.25                # Confidence threshold for string detection
 MIN_CENTER_DIST       = 8                   # Minimum distance between object centers to avoid duplicates
-MIN_SPACING_STRINGS   = 20                  # Minimum required spacing between detected strings
+MIN_SPACING_STRINGS   = 12                  # Minimum required spacing between detected strings
 VELOCITY_THRESH       = 8                   # Threshold to detect downstroke motion
 MAX_KEYPOINT_DIST     = 5                   # Maximum distance from finger to string to consider contact
 
