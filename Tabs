@@ -106,7 +106,7 @@ while cap.isOpened():
             fret_centers = [(tuple(p), idx) for idx,p in enumerate(sorted_fc)]
             for (cx, cy), num in fret_centers:
                 cv2.putText(frame, str(num), (int(cx), int(cy)-10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
 
     # String Detection
     res_s = model_strings(orig, verbose=False)[0]
@@ -151,9 +151,9 @@ while cap.isOpened():
                 length = np.hypot(W, H) + 50
                 x1, y1 = int(cx - dx*length), int(cy - dy*length)
                 x2, y2 = int(cx + dx*length), int(cy + dy*length)
-                cv2.line(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+                cv2.line(frame, (x1,y1), (x2,y2), (0,0,0), 2)
                 cv2.putText(frame, string_labels[idx], (int(cx-10), int(cy-10)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
 
     # Hand landmark detection
     rgb            = cv2.cvtColor(orig, cv2.COLOR_BGR2RGB)
@@ -219,11 +219,11 @@ while cap.isOpened():
                 fret_num = fret_left[1]
                 string_label = string_labels[s_idx]
                 frame_map[selected_kp_id] = (string_label, fret_num)
-                cv2.circle(frame, selected_kp, 5, (0,0,255), -1)
+                cv2.circle(frame, selected_kp, 5, (0,0,0), -1)
                 cv2.putText(frame, f"{string_label}{fret_num}", (selected_kp[0]+5, selected_kp[1]-5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
         stroke_frames.append((frame_idx, frame_map))
-        cv2.putText(frame, "Downstroke", (50,50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,0,0), 2)
+        cv2.putText(frame, "Downstroke", (50,50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,0), 2)
     
     # Write frame to output video
     out.write(frame)
